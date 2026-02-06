@@ -65,6 +65,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
         self.udp_stream_to_transport = {}
         self.udp_last_activity = {}
         self.udp_stream_rx = {}
+        self._closed_streams = set()
         active_protocols.append(self)
         asyncio.create_task(self.cleanup_stale_udp_connections())
         asyncio.create_task(self.check_start_connectivity())
@@ -127,12 +128,16 @@ class TunnelClientProtocol(QuicConnectionProtocol):
         self.udp_stream_rx.clear()
 
     def close_this_stream(self, stream_id):
+        if stream_id in self._closed_streams:
+            return
+        self._closed_streams.add(stream_id)
         try:
-            logger.info(f"FIN to stream={stream_id} sent")
+            logger.debug(f"FIN to stream={stream_id} sent")
             self._quic.send_stream_data(stream_id, b"", end_stream=True)
             self.transmit()
         except Exception as e:
-            logger.info(f"Error closing stream at client: {e}")
+            # Often happens if FIN already sent; keep debug-level.
+            logger.debug(f"Error closing stream at client: {e}")
 
         try:
             if stream_id in self.tcp_connections:

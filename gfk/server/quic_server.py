@@ -49,6 +49,7 @@ class TunnelServerProtocol(QuicConnectionProtocol):
         self.udp_connections = {}  # Map UDP connections to QUIC streams
         self.udp_last_activity = {}  # Track last activity time for UDP connections
         self.udp_stream_rx = {}  # Per-stream reassembly buffers for UDP frames
+        self._closed_streams = set()
         active_protocols.append(self)  # Add this protocol instance to the list
         try:
             asyncio.create_task(self.cleanup_stale_udp_connections())
@@ -81,12 +82,16 @@ class TunnelServerProtocol(QuicConnectionProtocol):
 
 
     def close_this_stream(self, stream_id):
+        if stream_id in self._closed_streams:
+            return
+        self._closed_streams.add(stream_id)
         try:
-            logger.info(f"FIN to stream={stream_id} sent")
+            logger.debug(f"FIN to stream={stream_id} sent")
             self._quic.send_stream_data(stream_id, b"", end_stream=True)  # Send FIN flag
             self.transmit()  # Send the FIN flag over the network
         except Exception as e:
-            logger.info(f"Error closing stream at server: {e}")
+
+            logger.debug(f"Error closing stream at server: {e}")
 
         try:
             if stream_id in self.tcp_connections:
