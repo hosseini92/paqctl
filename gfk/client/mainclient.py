@@ -1,10 +1,9 @@
 import subprocess
-import os
 import time
 import sys
 import signal
 
-scripts = ['quic_client.py', 'vio_client.py']
+scripts = ["quic_client.py", "vio_client.py"]
 
 
 def kill_existing_script(script_name):
@@ -37,17 +36,28 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-if __name__ == "__main__":
+def register_signals():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+
+def start_client(*, sleep=time.sleep):
+    """
+    Start GFK client components and store them in `processes`.
+    Separated for easier unit testing.
+    """
     print("Starting GFK client...")
     p1 = run_script(scripts[0])
-    time.sleep(1)
+    sleep(1)
     p2 = run_script(scripts[1])
     processes.extend([p1, p2])
-
     print("GFK running. Press Ctrl+C to stop.\n")
+    return p1, p2
+
+
+if __name__ == "__main__":
+    register_signals()
+    p1, p2 = start_client()
 
     try:
         p1.wait()

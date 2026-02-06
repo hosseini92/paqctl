@@ -20,25 +20,74 @@ tcp_options=[
     ('SAckOK', ''),
 ]
 
+basepkt = None
+skt = None
+
+
+def _ensure_sender():
+    """
+    Initialize the scapy L3 sender lazily.
+
+    This allows importing the module (and running unit tests) without root.
+    """
+    global basepkt, skt
+    if basepkt is None:
+        logger.info("Using L3 socket for violated TCP packets")
+        basepkt = IP(dst=vps_ip) / TCP(
+            sport=vio_tcp_client_port,
+            dport=vio_tcp_server_port,
+            seq=0,
+            flags=tcp_flags,
+            ack=0,
+            options=tcp_options,
+        ) / Raw(load=b"")
+    if skt is None:
+        skt = conf.L3socket()
+
+
+async def _close_and_abort_transport(transport) -> None:
+    """
+    Best-effort close/abort a datagram transport.
+
+    This keeps the cleanup sequence in one place so it stays consistent and
+    becomes easier to unit-test.
+    """
+    try:
+        transport.close()
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+    try:
+        transport.abort()
+        logger.info("aborting transport ...")
+    except Exception:
+        pass
+    await asyncio.sleep(1.5)
+    logger.info("vio inner finished")
+
 
 async def async_sniff_realtime(qu1):
     logger.info("sniffer started")
     try:
         def process_packet(packet):
             # Check flags using 'in' to handle different flag orderings (AP vs PA)
-            flags = str(packet[TCP].flags) if packet.haslayer(TCP) else ''
-            if packet.haslayer(TCP) and packet[IP].src == vps_ip and packet[TCP].sport == vio_tcp_server_port and 'A' in flags and 'P' in flags:
+            flags = str(packet[TCP].flags) if packet.haslayer(TCP) else ""
+            if (
+                packet.haslayer(TCP)
+                and packet[IP].src == vps_ip
+                and packet[TCP].sport == vio_tcp_server_port
+                and "A" in flags
+                and "P" in flags
+            ):
                 data1 = packet[TCP].load
                 qu1.put_nowait(data1)
 
-        async def start_sniffer():
-            sniffer = AsyncSniffer(prn=process_packet,
-                                    filter=f"tcp and src host {vps_ip} and src port {vio_tcp_server_port}",
-                                    store=False)
-            sniffer.start()
-            return sniffer
-
-        sniffer = await start_sniffer()
+        sniffer = AsyncSniffer(
+            prn=process_packet,
+            filter=f"tcp and src host {vps_ip} and src port {vio_tcp_server_port}",
+            store=False,
+        )
+        sniffer.start()
         return sniffer
     except Exception as e:
         logger.info(f"sniff Generic error: {e}....")
@@ -51,7 +100,7 @@ async def forward_vio_to_quic(qu1, transport):
     try:
         while True:
             data = await qu1.get()
-            if data == None:
+            if data is None:
                 break
             transport.sendto(data, addr)
     except Exception as e:
@@ -60,19 +109,8 @@ async def forward_vio_to_quic(qu1, transport):
         logger.info(f"Task vio to Quic Ended.")
 
 
-logger.info("Using L3 socket for violated TCP packets")
-basepkt = IP(dst=vps_ip) / TCP(
-    sport=vio_tcp_client_port,
-    dport=vio_tcp_server_port,
-    seq=0,
-    flags=tcp_flags,
-    ack=0,
-    options=tcp_options,
-) / Raw(load=b"")
-skt = conf.L3socket()
-
-
 def send_to_violated_TCP(binary_data):
+    _ensure_sender()
     new_pkt = basepkt.copy()
     new_pkt[TCP].load = binary_data
     skt.send(new_pkt)
@@ -83,7 +121,7 @@ async def forward_quic_to_vio(protocol):
     try:
         while True:
             data = await protocol.queue.get()
-            if data == None:
+            if data is None:
                 break
             send_to_violated_TCP(data)
     except Exception as e:
@@ -94,6 +132,9 @@ async def forward_quic_to_vio(protocol):
 
 async def start_udp_server(qu1):
     while True:
+        transport = None
+        task1 = None
+        task2 = None
         try:
             logger.warning(f"listen quic:{vio_udp_client_port} -> violated tcp:{vio_tcp_server_port}")
             loop = asyncio.get_event_loop()
@@ -107,8 +148,10 @@ async def start_udp_server(qu1):
             while True:
                 await asyncio.sleep(0.02)
                 if udp_protocol.has_error:
-                    task1.cancel()
-                    task2.cancel()
+                    if task1 is not None:
+                        task1.cancel()
+                    if task2 is not None:
+                        task2.cancel()
                     await asyncio.sleep(1)
                     logger.info(f"all task cancelled")
                     break
@@ -116,12 +159,8 @@ async def start_udp_server(qu1):
         except Exception as e:
             logger.info(f"vioclient ERR: {e}")
         finally:
-            transport.close()
-            await asyncio.sleep(0.5)
-            transport.abort()
-            logger.info("aborting transport ...")
-            await asyncio.sleep(1.5)
-            logger.info("vio inner finished")
+            if transport is not None:
+                await _close_and_abort_transport(transport)
 
 
 class UdpProtocol:
@@ -165,10 +204,7 @@ async def run_vio_client():
         qu1 = asyncio.Queue()
         sniffer = await async_sniff_realtime(qu1)
 
-        await asyncio.gather(
-            start_udp_server(qu1),
-            return_exceptions=True
-        )
+        await asyncio.gather(start_udp_server(qu1), return_exceptions=True)
 
         logger.info("end ?")
     except SystemExit as e:

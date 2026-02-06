@@ -50,8 +50,16 @@ class _UdpReassembler:
         return out
 
 
+def is_ready_message(data: bytes, auth_code: str) -> bool:
+    return data == (auth_code + "i am ready,!###!").encode("utf-8")
+
+
 class TunnelClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
+        # Optional dependency injection for easier unit testing
+        self._create_task = kwargs.pop("create_task", asyncio.create_task)
+        self._sleep = kwargs.pop("sleep", asyncio.sleep)
+
         global is_quic_established
         is_quic_established = False
 
@@ -67,13 +75,24 @@ class TunnelClientProtocol(QuicConnectionProtocol):
         self.udp_stream_rx = {}
         self._closed_streams = set()
         active_protocols.append(self)
-        asyncio.create_task(self.cleanup_stale_udp_connections())
-        asyncio.create_task(self.check_start_connectivity())
+        self._spawn(self.cleanup_stale_udp_connections())
+        self._spawn(self.check_start_connectivity())
+
+    def _spawn(self, coro):
+        """
+        Create a background task using injected scheduler (for testability).
+        Safe to call on objects created via `object.__new__`.
+        """
+        create_task = getattr(self, "_create_task", asyncio.create_task)
+        try:
+            return create_task(coro)
+        except Exception:
+            return None
 
     async def check_start_connectivity(self):
         global is_quic_established
         try:
-            await asyncio.sleep(7)
+            await getattr(self, "_sleep", asyncio.sleep)(7)
             if is_quic_established:
                 logger.info(f"Quic Established!")
             else:
@@ -90,27 +109,28 @@ class TunnelClientProtocol(QuicConnectionProtocol):
             return
         self._closing = True
         super().connection_lost(exc)
-        self.close_all_tcp_connections()
         logger.info("QUIC connection lost. exit")
-        for protocol in active_protocols:
-            protocol.close_all_tcp_connections()
-            protocol.close_all_udp_connections()
-            protocol.close()
-            protocol = None
-        if self in active_protocols:
-            active_protocols.remove(self)
-        time.sleep(1)
+        # Close resources for all known protocols. Use a snapshot to avoid
+        # mutating the list while iterating.
+        for protocol in list(active_protocols):
+            try:
+                protocol.close_all_tcp_connections()
+                protocol.close_all_udp_connections()
+                protocol.close()
+            except Exception:
+                pass
+        active_protocols.clear()
         sys.exit()
 
     def close_all_tcp_connections(self):
         logger.info("close all tcp")
-        for stream_id, (reader, writer) in self.tcp_connections.items():
+        for stream_id, (reader, writer) in list(self.tcp_connections.items()):
             logger.info(f"Closing TCP connection for stream {stream_id}...")
             try:
                 writer.close()
             except Exception as e:
                 logger.info(f"Error closing tcp socket: {e}")
-        for stream_id, (reader, writer) in self.tcp_syn_wait.items():
+        for stream_id, (reader, writer) in list(self.tcp_syn_wait.items()):
             logger.info(f"Closing TCP connection for stream {stream_id}...")
             try:
                 writer.close()
@@ -121,6 +141,11 @@ class TunnelClientProtocol(QuicConnectionProtocol):
 
     def close_all_udp_connections(self):
         logger.info("close all udp")
+        for stream_id, transport in list(self.udp_stream_to_transport.items()):
+            try:
+                transport.close()
+            except Exception:
+                pass
         self.udp_addr_to_stream.clear()
         self.udp_stream_to_addr.clear()
         self.udp_last_activity.clear()
@@ -140,30 +165,31 @@ class TunnelClientProtocol(QuicConnectionProtocol):
             logger.debug(f"Error closing stream at client: {e}")
 
         try:
-            if stream_id in self.tcp_connections:
+            tcp = self.tcp_connections.pop(stream_id, None)
+            if tcp is not None:
                 try:
-                    writer = self.tcp_connections[stream_id][1]
-                    writer.close()
-                    del self.tcp_connections[stream_id]
+                    tcp[1].close()
                 except Exception as e:
                     logger.info(f"Error closing tcp estblsh at client: {e}")
-            if stream_id in self.tcp_syn_wait:
+
+            syn = self.tcp_syn_wait.pop(stream_id, None)
+            if syn is not None:
                 try:
-                    writer = self.tcp_syn_wait[stream_id][1]
-                    writer.close()
-                    del self.tcp_syn_wait[stream_id]
+                    syn[1].close()
                 except Exception as e:
                     logger.info(f"Error closing tcp syn at client: {e}")
-            if stream_id in self.udp_stream_to_addr:
-                try:
-                    addr = self.udp_stream_to_addr.get(stream_id)
-                    del self.udp_addr_to_stream[addr]
-                    del self.udp_stream_to_addr[stream_id]
-                    del self.udp_last_activity[stream_id]
-                    del self.udp_stream_to_transport[stream_id]
-                    self.udp_stream_rx.pop(stream_id, None)
-                except Exception as e:
-                    logger.info(f"Error closing udp at client: {e}")
+
+            addr = self.udp_stream_to_addr.pop(stream_id, None)
+            if addr is not None:
+                self.udp_addr_to_stream.pop(addr, None)
+                self.udp_last_activity.pop(stream_id, None)
+                transport = self.udp_stream_to_transport.pop(stream_id, None)
+                if transport is not None:
+                    try:
+                        transport.close()
+                    except Exception:
+                        pass
+                self.udp_stream_rx.pop(stream_id, None)
         except Exception as e:
             logger.info(f"Error closing socket at client: {e}")
 
@@ -171,7 +197,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
         logger.info("UDP cleanup task running!")
         check_time = min(parameters.udp_timeout, 60)
         while True:
-            await asyncio.sleep(check_time)
+            await getattr(self, "_sleep", asyncio.sleep)(check_time)
             current_time = self.loop.time()
             stale_streams = [
                 stream_id for stream_id, last_time in self.udp_last_activity.items()
@@ -231,7 +257,6 @@ class TunnelClientProtocol(QuicConnectionProtocol):
                 else:
                     stream_id = self.new_udp_stream(addr, udp_protocol)
                     if stream_id is not None:
-                        await asyncio.sleep(0.1)
                         self.udp_last_activity[stream_id] = self.loop.time()
                         self._quic.send_stream_data(stream_id=stream_id, data=_udp_frame(data), end_stream=False)
                         self.transmit()
@@ -272,7 +297,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
                     writer = self.tcp_connections[event.stream_id][1]
                     try:
                         writer.write(event.data)
-                        asyncio.create_task(writer.drain())
+                        self._spawn(writer.drain())
                     except Exception as e:
                         # If writer is in a bad state, close this stream.
                         logger.info(f"Client TCP writer error on stream {event.stream_id}: {e}")
@@ -287,10 +312,13 @@ class TunnelClientProtocol(QuicConnectionProtocol):
                         self.udp_stream_rx[event.stream_id] = rx
                     for datagram in rx.feed(event.data):
                         transport.sendto(datagram, addr)
+                    # Count inbound traffic as activity to avoid idle-close while the
+                    # remote is sending but local is quiet.
+                    self.udp_last_activity[event.stream_id] = self.loop.time()
 
                 elif event.stream_id in self.tcp_syn_wait:
-                    if event.data == (parameters.quic_auth_code + "i am ready,!###!").encode("utf-8"):
-                        asyncio.create_task(self.forward_tcp_to_quic(event.stream_id))
+                    if is_ready_message(event.data, parameters.quic_auth_code):
+                        self._spawn(self.forward_tcp_to_quic(event.stream_id))
                 else:
                     logger.warning("unknown Data arrived to client")
 
