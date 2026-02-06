@@ -1,230 +1,353 @@
-from scapy.all import AsyncSniffer,IP,TCP,Raw,conf
+from scapy.all import AsyncSniffer, IP, TCP, Raw, conf
 import asyncio
-import random
 import parameters
 import logging
-import time
-
-
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple, Any, Awaitable
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("VioServer")
 
-
 vps_ip = parameters.vps_ip
-
 vio_tcp_server_port = parameters.vio_tcp_server_port
-vio_udp_server_port = parameters.vio_udp_server_port
 quic_local_ip = parameters.quic_local_ip
 quic_server_port = parameters.quic_server_port
 tcp_flags = getattr(parameters, 'tcp_flags', 'AP')
 
+# How long to keep an idle client session (seconds)
+SESSION_IDLE_TIMEOUT = int(getattr(parameters, "udp_timeout", 300))
+
+tcp_options = [
+    ("MSS", 1280),
+    ("WScale", 8),
+    ("SAckOK", ""),
+]
+
+# Raw-socket sender is initialized lazily (so importing this module doesn't
+# require CAP_NET_RAW / root, which also makes unit testing possible).
+_basepkt = None
+_skt = None
 
 
-global client_ip # obtained during sniffing
-global client_port # obtained during sniffing
-
-client_ip = "1.1.1.1"
-client_port = 443
-
-tcp_options=[
-        ('MSS', 1280),  # Maximum Segment Size
-        ('WScale', 8),  # Window Scale
-        ('SAckOK', ''),  # Selective ACK Permitted
-    ]
-
-
+def _ensure_sender():
+    global _basepkt, _skt
+    if _basepkt is None:
+        # Base packet template for server->client violated TCP
+        _basepkt = (
+            IP(src=vps_ip)
+            / TCP(sport=vio_tcp_server_port, seq=1, flags=tcp_flags, ack=0, options=tcp_options)
+            / Raw(load=b"")
+        )
+    if _skt is None:
+        _skt = conf.L3socket()
 
 
-async def async_sniff_realtime(qu1):
-    logger.info("sniffer started")
-    try:
-        def process_packet(packet):
-            # logger.info(f"sniffed before if at {time.time()}")
-            # Check flags using 'in' to handle different flag orderings (AP vs PA)
-            flags = str(packet[TCP].flags) if packet.haslayer(TCP) else ''
-            if packet.haslayer(TCP) and packet[TCP].dport == vio_tcp_server_port and 'A' in flags and 'P' in flags:
-                data1 = packet[TCP].load
-                client_ip = packet[IP].src
-                client_port = packet[TCP].sport
-                qu1.put_nowait( (data1,client_ip,client_port) )
-                # logger.info(f"sniffed on tcp : {client_ip} {client_port}     at   {time.time()}")
-
-
-        async def start_sniffer():
-            sniffer = AsyncSniffer(prn=process_packet,
-                                   filter=f"tcp and dst host {vps_ip} and dst port {vio_tcp_server_port}",
-                                   store=False)
-            sniffer.start()
-            return sniffer
-
-        sniffer = await start_sniffer()
-        return sniffer
-    except Exception as e:
-        logger.info(f"sniff Generic error: {e}....")
-
-
-
-
-async def forward_vio_to_quic(qu1, transport):
-    global client_ip
-    global client_port
-    logger.info(f"Task vio to Quic started")
-    addr = (quic_local_ip,quic_server_port)
-    # addr = ("192.168.1.140",quic_server_port)
-    try:
-        while True:
-            # update client_ip, client_port from the queue
-            data,client_ip,client_port = await qu1.get()
-            # logger.info(f"data qu1 fetched {data} at {time.time()}")
-            if(data == None):
-                break
-            transport.sendto(data , addr)
-            # logger.info(f"data sent to udp {data} -> {addr} at {time.time()}")
-            # qu1.task_done()
-    except Exception as e:
-        logger.info(f"Error forwarding vio to Quic: {e}")
-    finally:
-        logger.info(f"Task vio to Quic Ended.")
-
-
-
-basepkt = IP(src=vps_ip) / TCP(sport=vio_tcp_server_port, seq=1, flags=tcp_flags, ack=0, options=tcp_options) / Raw(load=b"")
-
-skt = conf.L3socket()
-
-def send_to_violated_TCP(binary_data,client_ip,client_port):
-    # logger.info(f"client ip = {client_ip}")
-    new_pkt = basepkt.copy()
+def send_to_violated_tcp(binary_data: bytes, client_ip: str, client_port: int) -> None:
+    _ensure_sender()
+    new_pkt = _basepkt.copy()
     new_pkt[IP].dst = client_ip
     new_pkt[TCP].dport = client_port
-    # new_pkt[TCP].seq = random.randint(1024,1048576)
-    # new_pkt[TCP].ack = random.randint(1024,1048576)
     new_pkt[TCP].load = binary_data
-    skt.send(new_pkt)
+    _skt.send(new_pkt)
 
 
+def extract_vio_packet(packet, expected_dport: int) -> Optional[Tuple[bytes, str, int]]:
+    """
+    Extract a violated-TCP payload from a sniffed packet.
 
-
-async def forward_quic_to_vio(protocol):
-    logger.info(f"Task QUIC to vio started")
-    global client_ip
-    global client_port
+    Returns (payload_bytes, client_ip, client_port) or None if packet should be ignored.
+    """
     try:
-        while True:
-            data = await protocol.queue.get()  # Wait for data from UDP
-            if(data == None):
-                break
-            send_to_violated_TCP(data,client_ip,client_port)
-            # logger.info(f"data send to tcp {data} at {time.time()}")
-    except Exception as e:
-        logger.info(f"Error forwarding QUIC to vio: {e}")
-    finally:
-        logger.info(f"Task QUIC to vio Ended.")
+        if not packet.haslayer(TCP) or not packet.haslayer(IP):
+            return None
+        flags = str(packet[TCP].flags)
+        if int(packet[TCP].dport) != int(expected_dport):
+            return None
+        # Check flags using 'in' to handle different flag orderings (AP vs PA)
+        if "A" not in flags or "P" not in flags:
+            return None
+        payload = bytes(packet[TCP].load)
+        client_ip_addr = str(packet[IP].src)
+        client_port_num = int(packet[TCP].sport)
+        return payload, client_ip_addr, client_port_num
+    except Exception:
+        return None
 
 
+class SessionUdpProtocol:
+    """
+    One UDP "view" into the local QUIC server for a single client.
+    QUIC server differentiates clients by (src_ip, src_port), so we must use
+    a distinct local UDP source port per client session.
+    """
 
-
-async def start_udp_server(qu1):
-        while True:
-            try:
-                logger.warning(f"violated tcp:{vio_tcp_server_port} -> quic {quic_local_ip}:{quic_server_port} -> ")
-                loop = asyncio.get_event_loop()
-                transport, udp_protocol = await loop.create_datagram_endpoint(
-                    lambda: UdpProtocol(),
-                    local_addr=("0.0.0.0", vio_udp_server_port),
-                    remote_addr=(quic_local_ip, quic_server_port)
-                    # remote_addr=("192.168.1.140", quic_server_port)
-                )
-
-                task1 = asyncio.create_task(forward_quic_to_vio(udp_protocol))
-                task2 = asyncio.create_task(forward_vio_to_quic(qu1,transport))
-
-                while True:
-                    await asyncio.sleep(0.02)  # this make async loop to switch better between process
-                    if(udp_protocol.has_error):
-                        task1.cancel()
-                        task2.cancel()
-                        await asyncio.sleep(1)
-                        logger.info(f"all task cancelled")
-                        break
-
-            except Exception as e:
-                logger.info(f"vioServer ERR: {e}")
-            finally:
-                transport.close()
-                await asyncio.sleep(0.5)
-                transport.abort()
-                logger.info("aborting transport ...")
-                await asyncio.sleep(1.5)
-                logger.info("vio inner finished")
-
-
-
-
-class UdpProtocol:
-    def __init__(self):
+    def __init__(self) -> None:
         self.transport = None
+        self.queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
         self.has_error = False
-        self.queue = asyncio.Queue()
 
     def connection_made(self, transport):
-        logger.info("NEW DGRAM socket created")
-        logger.info(transport.get_extra_info('socket'))
         self.transport = transport
 
-    def pause_writing(self):
-        pass  # UDP doesn't need flow control, but we had to implement
-
-    def resume_writing(self):
-        pass  # UDP doesn't need flow control, but we had to implement
-
-    def datagram_received(self, data, addr):
+    def datagram_received(self, data: bytes, addr):
         self.queue.put_nowait(data)
-        # logger.info(f"data received from udp {data} at {time.time()}")
 
     def error_received(self, exc):
-        logger.info(f"UDP error received: {exc}")
         self.has_error = True
-        if(self.transport):
+        self.queue.put_nowait(None)
+        if self.transport:
             self.transport.close()
-            logger.info("UDP transport closed")
 
     def connection_lost(self, exc):
-        logger.info(f"UDP lost. {exc}")
         self.has_error = True
-        if(self.transport):
+        self.queue.put_nowait(None)
+        if self.transport:
             self.transport.close()
-            logger.info("UDP transport closed")
 
 
+async def start_sniffer(incoming_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    logger.info("sniffer started")
+
+    def process_packet(packet):
+        extracted = extract_vio_packet(packet, vio_tcp_server_port)
+        if extracted is None:
+            return
+        data1, client_ip, client_port = extracted
+        # AsyncSniffer runs in another thread; use thread-safe scheduling.
+        loop.call_soon_threadsafe(incoming_queue.put_nowait, (data1, client_ip, client_port))
+
+    sniffer = AsyncSniffer(
+        prn=process_packet,
+        filter=f"tcp and dst host {vps_ip} and dst port {vio_tcp_server_port}",
+        store=False,
+    )
+    sniffer.start()
+    return sniffer
 
 
-async def run_vio_server():
-    sniffer = None
+async def session_forward_vio_to_quic(vio_to_quic_q: asyncio.Queue, transport):
     try:
-        qu1 = asyncio.Queue()
-        sniffer = await async_sniff_realtime(qu1)
-
-        await asyncio.gather(
-            start_udp_server(qu1),
-            return_exceptions=True
-        )
-
-        logger.info("end ?")
-    except SystemExit as e:
-        logger.info(f"Caught SystemExit: {e}")
-    except asyncio.CancelledError as e:
-        logger.info(f"cancelling error: {e}")
-    except ConnectionError as e:
-        logger.info(f"Connection error: {e}")
+        while True:
+            data = await vio_to_quic_q.get()
+            if data is None:
+                break
+            transport.sendto(data)
     except Exception as e:
-        logger.info(f"Generic error: {e}")
+        logger.info(f"Error forwarding VIO->QUIC: {e}")
+
+
+async def session_forward_quic_to_vio(client_ip: str, client_port: int, protocol: SessionUdpProtocol, touch):
+    try:
+        while True:
+            data = await protocol.queue.get()
+            if data is None:
+                break
+            touch()
+            send_to_violated_tcp(data, client_ip, client_port)
+    except Exception as e:
+        logger.info(f"Error forwarding QUIC->VIO: {e}")
+
+
+@dataclass
+class VioSession:
+    transport: Any
+    protocol: SessionUdpProtocol
+    vio_to_quic_q: "asyncio.Queue[Optional[bytes]]"
+    tasks: Tuple[asyncio.Task, asyncio.Task]
+    last: float
+
+
+class VioServerCore:
+    """
+    Session manager for multi-client VIO<->QUIC bridging.
+
+    Client identity is (client_ip, client_port) extracted from violated TCP packets.
+    """
+
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        quic_local_ip_addr: str,
+        quic_server_port_num: int,
+        session_idle_timeout: int,
+        create_datagram_endpoint: Callable[..., Awaitable[Tuple[Any, SessionUdpProtocol]]],
+        create_task: Callable[[Awaitable], asyncio.Task] = asyncio.create_task,
+        send_to_client: Callable[[bytes, str, int], None] = send_to_violated_tcp,
+        protocol_factory: Callable[[], SessionUdpProtocol] = SessionUdpProtocol,
+    ) -> None:
+        self._loop = loop
+        self._quic_local_ip = quic_local_ip_addr
+        self._quic_server_port = int(quic_server_port_num)
+        self._timeout = int(session_idle_timeout)
+        self._create_datagram_endpoint = create_datagram_endpoint
+        self._create_task = create_task
+        self._send_to_client = send_to_client
+        self._protocol_factory = protocol_factory
+
+        self.sessions: Dict[Tuple[str, int], VioSession] = {}
+
+    async def close_session(self, key: Tuple[str, int]) -> None:
+        sess = self.sessions.pop(key, None)
+        if sess is None:
+            return
+        try:
+            sess.vio_to_quic_q.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            sess.transport.close()
+        except Exception:
+            pass
+        for t in sess.tasks:
+            t.cancel()
+        # Drain cancellations to avoid "Task was destroyed but it is pending!"
+        await asyncio.gather(*sess.tasks, return_exceptions=True)
+
+    async def ensure_session(self, client_ip_addr: str, client_port_num: int) -> VioSession:
+        key = (client_ip_addr, int(client_port_num))
+        existing = self.sessions.get(key)
+        if existing is not None:
+            existing.last = self._loop.time()
+            return existing
+
+        transport, protocol = await self._create_datagram_endpoint(
+            lambda: self._protocol_factory(),
+            local_addr=(self._quic_local_ip, 0),
+            remote_addr=(self._quic_local_ip, self._quic_server_port),
+        )
+        vio_to_quic_q: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+
+        def touch() -> None:
+            s = self.sessions.get(key)
+            if s is not None:
+                s.last = self._loop.time()
+
+        async def forward_quic_to_vio_task():
+            try:
+                while True:
+                    data = await protocol.queue.get()
+                    if data is None:
+                        break
+                    touch()
+                    try:
+                        self._send_to_client(data, client_ip_addr, int(client_port_num))
+                    except Exception as e:
+                        logger.info(f"send_to_client failed for {client_ip_addr}:{client_port_num}: {e}")
+                        break
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.info(f"QUIC->VIO task error for {client_ip_addr}:{client_port_num}: {e}")
+
+        async def forward_vio_to_quic_task():
+            try:
+                while True:
+                    data = await vio_to_quic_q.get()
+                    if data is None:
+                        break
+                    try:
+                        transport.sendto(data)
+                    except Exception as e:
+                        logger.info(f"VIO->QUIC send failed for {client_ip_addr}:{client_port_num}: {e}")
+                        break
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.info(f"VIO->QUIC task error for {client_ip_addr}:{client_port_num}: {e}")
+
+        t1 = self._create_task(forward_vio_to_quic_task())
+        t2 = self._create_task(forward_quic_to_vio_task())
+
+        sess = VioSession(
+            transport=transport,
+            protocol=protocol,
+            vio_to_quic_q=vio_to_quic_q,
+            tasks=(t1, t2),
+            last=self._loop.time(),
+        )
+        self.sessions[key] = sess
+        logger.info(f"New client session: {client_ip_addr}:{client_port_num}")
+        return sess
+
+    async def dispatch_vio_payload(self, payload: bytes, client_ip_addr: str, client_port_num: int) -> None:
+        sess = await self.ensure_session(client_ip_addr, int(client_port_num))
+        sess.last = self._loop.time()
+        sess.vio_to_quic_q.put_nowait(payload)
+
+    async def cleanup_stale(self, *, now: Optional[float] = None) -> int:
+        if now is None:
+            now = self._loop.time()
+        stale = [k for k, s in self.sessions.items() if now - s.last > self._timeout]
+        for k in stale:
+            await self.close_session(k)
+        return len(stale)
+
+
+async def run_vio_server(*, run_seconds: Optional[float] = None) -> None:
+    loop = asyncio.get_running_loop()
+    sniffer = None
+    incoming: "asyncio.Queue[Tuple[bytes, str, int]]" = asyncio.Queue()
+    stop_event = asyncio.Event()
+    tasks: list[asyncio.Task] = []
+
+    core = VioServerCore(
+        loop=loop,
+        quic_local_ip_addr=quic_local_ip,
+        quic_server_port_num=quic_server_port,
+        session_idle_timeout=SESSION_IDLE_TIMEOUT,
+        create_datagram_endpoint=loop.create_datagram_endpoint,
+    )
+
+    async def dispatcher():
+        try:
+            while True:
+                if stop_event.is_set():
+                    return
+                data, cip, cport = await incoming.get()
+                await core.dispatch_vio_payload(data, cip, cport)
+        except asyncio.CancelledError:
+            return
+
+    async def cleanup():
+        try:
+            while True:
+                if stop_event.is_set():
+                    return
+                await asyncio.sleep(5)
+                closed = await core.cleanup_stale()
+                if closed:
+                    logger.info(f"Closed {closed} idle session(s)")
+        except asyncio.CancelledError:
+            return
+
+    try:
+        sniffer = await start_sniffer(incoming, loop)
+        tasks = [asyncio.create_task(dispatcher()), asyncio.create_task(cleanup())]
+        if run_seconds is None:
+            await asyncio.gather(*tasks)
+        else:
+            await asyncio.sleep(run_seconds)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.info(f"vio_server fatal error: {e}")
     finally:
+        stop_event.set()
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if sniffer is not None:
-            sniffer.stop()
-            logger.info("stop sniffer")
+            try:
+                sniffer.stop()
+            except Exception:
+                pass
+        # Close sessions
+        for k in list(core.sessions.keys()):
+            await core.close_session(k)
+        logger.info("vio_server stopped")
 
 
 if __name__ == "__main__":

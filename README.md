@@ -92,7 +92,9 @@ It does **not** automatically open your forwarded UDP ports; you must allow thos
 
 ## Multiple clients
 
-The upstream GFK `vio_server.py` in this repo keeps a single “current client” and can be unreliable with multiple simultaneous clients. If you need multiple clients, run **multiple GFK server instances** on different port sets, or modify the server to track per-client state.
+This repo’s GFK server has been updated to support **multiple simultaneous clients** by maintaining a separate internal QUIC/UDP session per client.
+
+Note: clients are identified by **source IP + source port** of the violated TCP packets. If you have multiple clients behind the same NAT using the same source port, set a unique `vio_tcp_client_port` per client.
 
 ## Commands
 
