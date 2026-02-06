@@ -1,8 +1,7 @@
-from scapy.all import AsyncSniffer,IP,TCP,Raw,conf,Ether,get_if_hwaddr
+from scapy.all import AsyncSniffer, IP, TCP, Raw, conf
 import asyncio
 import parameters
 import logging
-import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("VioClient")
@@ -14,16 +13,6 @@ vio_udp_client_port = parameters.vio_udp_client_port
 quic_local_ip = parameters.quic_local_ip
 quic_client_port = parameters.quic_client_port
 tcp_flags = getattr(parameters, 'tcp_flags', 'AP')
-
-# Windows-specific: get local IP and gateway MAC for Ethernet frames
-my_ip = getattr(parameters, 'my_ip', None)
-gateway_mac = getattr(parameters, 'gateway_mac', None)
-is_windows = os.name == 'nt'
-
-try:
-    local_mac = get_if_hwaddr(conf.iface)
-except Exception:
-    local_mac = None
 
 tcp_options=[
     ('MSS', 1280),
@@ -71,15 +60,16 @@ async def forward_vio_to_quic(qu1, transport):
         logger.info(f"Task vio to Quic Ended.")
 
 
-# Build base packet based on OS
-if is_windows and gateway_mac and my_ip and local_mac:
-    logger.info(f"Windows mode: using Ethernet frames (gw_mac={gateway_mac}, my_ip={my_ip})")
-    basepkt = Ether(dst=gateway_mac, src=local_mac) / IP(src=my_ip, dst=vps_ip) / TCP(sport=vio_tcp_client_port, dport=vio_tcp_server_port, seq=0, flags=tcp_flags, ack=0, options=tcp_options) / Raw(load=b"")
-    skt = conf.L2socket(iface=conf.iface)
-else:
-    logger.info(f"Linux mode: using L3 socket")
-    basepkt = IP(dst=vps_ip) / TCP(sport=vio_tcp_client_port, dport=vio_tcp_server_port, seq=0, flags=tcp_flags, ack=0, options=tcp_options) / Raw(load=b"")
-    skt = conf.L3socket()
+logger.info("Using L3 socket for violated TCP packets")
+basepkt = IP(dst=vps_ip) / TCP(
+    sport=vio_tcp_client_port,
+    dport=vio_tcp_server_port,
+    seq=0,
+    flags=tcp_flags,
+    ack=0,
+    options=tcp_options,
+) / Raw(load=b"")
+skt = conf.L3socket()
 
 
 def send_to_violated_TCP(binary_data):

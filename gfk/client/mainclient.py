@@ -3,45 +3,20 @@ import os
 import time
 import sys
 import signal
-import platform
-
-IS_WINDOWS = platform.system() == 'Windows'
 
 scripts = ['quic_client.py', 'vio_client.py']
 
 
 def kill_existing_script(script_name):
-    """Kill any existing instance of the script (cross-platform)"""
-    if IS_WINDOWS:
-        # On Windows, use taskkill to find and kill python processes
-        try:
-            result = subprocess.run(
-                ['wmic', 'process', 'where',
-                 f"commandline like '%{script_name}%' and name like '%python%'",
-                 'get', 'processid'],
-                capture_output=True, text=True, stderr=subprocess.DEVNULL
-            )
-            for line in result.stdout.split('\n'):
-                line = line.strip()
-                if line.isdigit():
-                    subprocess.run(['taskkill', '/F', '/PID', line],
-                                 stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        except Exception:
-            pass
-    else:
-        subprocess.run(['pkill', '-f', script_name], stderr=subprocess.DEVNULL)
+    """Kill any existing instance of the script."""
+    subprocess.run(['pkill', '-f', script_name], stderr=subprocess.DEVNULL)
 
 
 def run_script(script_name):
     """Start a script, killing any existing instance first"""
     kill_existing_script(script_name)
     time.sleep(0.5)
-
-    if IS_WINDOWS:
-        p = subprocess.Popen([sys.executable, script_name],
-                           creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-    else:
-        p = subprocess.Popen([sys.executable, script_name])
+    p = subprocess.Popen([sys.executable, script_name])
     return p
 
 
@@ -64,8 +39,7 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
-    if not IS_WINDOWS:
-        signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     print("Starting GFK client...")
     p1 = run_script(scripts[0])
