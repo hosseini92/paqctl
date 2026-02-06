@@ -30,7 +30,7 @@ WG client  --->  A_PUBLIC_IP:51830  ==GFK tunnel==>  B:51820  --->  WireGuard se
 Run on **System B**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/hosseini92/paqctl/main/paqctl.sh | sudo bash
 sudo paqctl config
 sudo paqctl start
 sudo paqctl status

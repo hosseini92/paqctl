@@ -14,7 +14,7 @@
 # ╚═══════════════════════════════════════════════════════════════════╝
 #
 # Install:
-# curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+# curl -fsSL https://raw.githubusercontent.com/hosseini92/paqctl/main/paqctl.sh | sudo bash
 #
 
 set -euo pipefail
@@ -34,10 +34,10 @@ SERVICE_FILE="/etc/systemd/system/paqctl.service"
 PID_FILE="/run/paqctl.pid"
 LOG_FILE="/var/log/gfk-backend.log"
 
-GFK_REPO="SamNet-dev/paqctl"
-GFK_BRANCH="main"
+GFK_REPO="${GFK_REPO:-hosseini92/paqctl}"
+GFK_BRANCH="${GFK_BRANCH:-main}"
 GFK_RAW_URL="https://raw.githubusercontent.com/${GFK_REPO}/${GFK_BRANCH}/gfk"
-PAQCTL_SCRIPT_URL="https://raw.githubusercontent.com/${GFK_REPO}/${GFK_BRANCH}/paqctl.sh"
+PAQCTL_SCRIPT_URL="${PAQCTL_SCRIPT_URL:-https://raw.githubusercontent.com/${GFK_REPO}/${GFK_BRANCH}/paqctl.sh}"
 
 # Defaults (match README)
 BACKEND="gfw-knocker"
@@ -88,6 +88,17 @@ has_systemd() {
   command -v systemctl &>/dev/null && [ -d /run/systemd/system ]
 }
 
+get_self_path() {
+  # Best effort: returns an on-disk path to this script when available.
+  # When executed via "curl ... | bash" there is no file to copy.
+  local src="${BASH_SOURCE[0]:-}"
+  if [ -n "$src" ] && [ -f "$src" ] && [ "$src" != "bash" ]; then
+    realpath "$src" 2>/dev/null || readlink -f "$src" 2>/dev/null || echo "$src"
+  else
+    echo ""
+  fi
+}
+
 detect_os_pkg_manager() {
   PKG_MANAGER="unknown"
   if command -v apt-get &>/dev/null; then
@@ -128,7 +139,12 @@ install_packages() {
 ensure_deps() {
   log_info "Installing dependencies..."
   # iptables is optional but recommended for server.
-  install_packages curl ca-certificates openssl python3 python3-venv python3-pip iproute2 || return 1
+  detect_os_pkg_manager
+  local iproute_pkg="iproute2"
+  case "$PKG_MANAGER" in
+    dnf|yum) iproute_pkg="iproute" ;;
+  esac
+  install_packages curl ca-certificates openssl python3 python3-venv python3-pip "$iproute_pkg" || return 1
   if ! command -v iptables &>/dev/null; then
     log_warn "iptables not found. Server firewall rules will be skipped."
   fi
@@ -537,8 +553,9 @@ ExecStopPost=/usr/local/bin/paqctl _remove-firewall
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65535
-StandardOutput=append:${LOG_FILE}
-StandardError=append:${LOG_FILE}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paqctl
 
 [Install]
 WantedBy=multi-user.target
@@ -649,6 +666,15 @@ change_config() {
   read -r -p "Continue? [y/N]: " confirm < /dev/tty || true
   [[ "$confirm" =~ ^[Yy]$ ]] || return 0
 
+  # If user runs "paqctl config" on a partially installed system, ensure components exist.
+  if [ ! -x "${VENV_DIR}/bin/python" ]; then
+    install_python_deps || return 1
+  fi
+  if [ ! -f "${GFK_DIR}/mainserver.py" ] || [ ! -f "${GFK_DIR}/mainclient.py" ]; then
+    download_gfk || return 1
+  fi
+  generate_certs || return 1
+
   wizard || return 1
   save_settings
   generate_parameters
@@ -688,6 +714,46 @@ install_management_script() {
   log_success "Installed management command: /usr/local/bin/paqctl"
 }
 
+show_menu() {
+  check_root
+  load_settings
+
+  while true; do
+    echo ""
+    print_header
+    echo -e "${BOLD}Installed config:${NC}"
+    echo "  Role:   ${ROLE:-<not configured>}"
+    echo "  Server: ${GFK_SERVER_IP:-<unset>}"
+    echo ""
+    echo -e "${BOLD}Menu:${NC}"
+    echo "  1) Status"
+    echo "  2) Start"
+    echo "  3) Stop"
+    echo "  4) Restart"
+    echo "  5) Info"
+    echo "  6) Logs"
+    echo "  7) Configure"
+    echo "  8) Uninstall"
+    echo "  0) Exit"
+    echo ""
+    local choice
+    read -r -p "Choice [0-8]: " choice < /dev/tty || true
+    case "$choice" in
+      1) status ;;
+      2) start ;;
+      3) stop ;;
+      4) restart ;;
+      5) show_info ;;
+      6) logs ;;
+      7) change_config ;;
+      8) uninstall; return 0 ;;
+      0) return 0 ;;
+      *) log_warn "Invalid choice: $choice" ;;
+    esac
+    load_settings
+  done
+}
+
 install_flow() {
   check_root
   print_header
@@ -716,7 +782,7 @@ install_flow() {
   generate_certs
   generate_parameters
   save_settings
-  install_management_script "${0:-}"
+  install_management_script "$(get_self_path)"
   setup_service || true
 
   echo ""
@@ -734,7 +800,7 @@ show_help() {
   cat <<EOF
 paqctl (GFK-only) - commands:
   install         Install / setup GFK
-  menu            Interactive configuration (same as: config)
+  menu            Interactive menu (status/start/stop/config/etc)
   config          Change configuration (regenerates parameters.py)
   start|stop|restart
   status
@@ -751,7 +817,8 @@ EOF
 
 case "${1:-install}" in
   install)         install_flow ;;
-  menu|config)     change_config ;;
+  menu)            show_menu ;;
+  config)          change_config ;;
   start)           check_root; start ;;
   stop)            check_root; stop ;;
   restart)         check_root; restart ;;
