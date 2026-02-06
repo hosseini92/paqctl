@@ -15,6 +15,41 @@ active_protocols = []
 is_quic_established = False
 
 
+def _udp_frame(payload: bytes) -> bytes:
+    """
+    Frame a single UDP datagram for transport over a QUIC stream.
+
+    QUIC streams are byte streams (no message boundaries), so we prefix each
+    datagram with a 2-byte big-endian length.
+    """
+    if payload is None:
+        raise ValueError("payload must be bytes")
+    ln = len(payload)
+    if ln > 0xFFFF:
+        raise ValueError(f"UDP payload too large to frame: {ln}")
+    return ln.to_bytes(2, "big") + payload
+
+
+class _UdpReassembler:
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        if not chunk:
+            return []
+        self.buf.extend(chunk)
+        out: list[bytes] = []
+        while True:
+            if len(self.buf) < 2:
+                break
+            ln = int.from_bytes(self.buf[0:2], "big")
+            if len(self.buf) < 2 + ln:
+                break
+            out.append(bytes(self.buf[2 : 2 + ln]))
+            del self.buf[: 2 + ln]
+        return out
+
+
 class TunnelClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         global is_quic_established
@@ -22,12 +57,14 @@ class TunnelClientProtocol(QuicConnectionProtocol):
 
         super().__init__(*args, **kwargs)
         self.loop = asyncio.get_event_loop()
+        self._closing = False
         self.tcp_connections = {}
         self.tcp_syn_wait = {}
         self.udp_addr_to_stream = {}
         self.udp_stream_to_addr = {}
         self.udp_stream_to_transport = {}
         self.udp_last_activity = {}
+        self.udp_stream_rx = {}
         active_protocols.append(self)
         asyncio.create_task(self.cleanup_stale_udp_connections())
         asyncio.create_task(self.check_start_connectivity())
@@ -47,6 +84,10 @@ class TunnelClientProtocol(QuicConnectionProtocol):
             logger.info(f"connectivity err: {e}")
 
     def connection_lost(self, exc):
+        # Prevent re-entrancy if multiple errors happen at once.
+        if self._closing:
+            return
+        self._closing = True
         super().connection_lost(exc)
         self.close_all_tcp_connections()
         logger.info("QUIC connection lost. exit")
@@ -83,6 +124,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
         self.udp_stream_to_addr.clear()
         self.udp_last_activity.clear()
         self.udp_stream_to_transport.clear()
+        self.udp_stream_rx.clear()
 
     def close_this_stream(self, stream_id):
         try:
@@ -114,6 +156,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
                     del self.udp_stream_to_addr[stream_id]
                     del self.udp_last_activity[stream_id]
                     del self.udp_stream_to_transport[stream_id]
+                    self.udp_stream_rx.pop(stream_id, None)
                 except Exception as e:
                     logger.info(f"Error closing udp at client: {e}")
         except Exception as e:
@@ -177,7 +220,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
 
                 stream_id = self.udp_addr_to_stream.get(addr)
                 if stream_id is not None:
-                    self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=False)
+                    self._quic.send_stream_data(stream_id=stream_id, data=_udp_frame(data), end_stream=False)
                     self.transmit()
                     self.udp_last_activity[stream_id] = self.loop.time()
                 else:
@@ -185,7 +228,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
                     if stream_id is not None:
                         await asyncio.sleep(0.1)
                         self.udp_last_activity[stream_id] = self.loop.time()
-                        self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=False)
+                        self._quic.send_stream_data(stream_id=stream_id, data=_udp_frame(data), end_stream=False)
                         self.transmit()
 
         except Exception as e:
@@ -203,6 +246,7 @@ class TunnelClientProtocol(QuicConnectionProtocol):
             self.udp_stream_to_addr[stream_id] = addr
             self.udp_stream_to_transport[stream_id] = udp_protocol.transport
             self.udp_last_activity[stream_id] = self.loop.time()
+            self.udp_stream_rx[stream_id] = _UdpReassembler()
 
             req_data = parameters.quic_auth_code + "connect,udp," + str(udp_protocol.target_port) + ",!###!"
             self._quic.send_stream_data(stream_id=stream_id, data=req_data.encode("utf-8"), end_stream=False)
@@ -221,13 +265,23 @@ class TunnelClientProtocol(QuicConnectionProtocol):
 
                 elif event.stream_id in self.tcp_connections:
                     writer = self.tcp_connections[event.stream_id][1]
-                    writer.write(event.data)
-                    asyncio.create_task(writer.drain())
+                    try:
+                        writer.write(event.data)
+                        asyncio.create_task(writer.drain())
+                    except Exception as e:
+                        # If writer is in a bad state, close this stream.
+                        logger.info(f"Client TCP writer error on stream {event.stream_id}: {e}")
+                        self.close_this_stream(event.stream_id)
 
                 elif event.stream_id in self.udp_stream_to_addr:
                     addr = self.udp_stream_to_addr[event.stream_id]
                     transport = self.udp_stream_to_transport[event.stream_id]
-                    transport.sendto(event.data, addr)
+                    rx = self.udp_stream_rx.get(event.stream_id)
+                    if rx is None:
+                        rx = _UdpReassembler()
+                        self.udp_stream_rx[event.stream_id] = rx
+                    for datagram in rx.feed(event.data):
+                        transport.sendto(datagram, addr)
 
                 elif event.stream_id in self.tcp_syn_wait:
                     if event.data == (parameters.quic_auth_code + "i am ready,!###!").encode("utf-8"):
@@ -237,6 +291,8 @@ class TunnelClientProtocol(QuicConnectionProtocol):
 
             except Exception as e:
                 logger.info(f"Quic event client error: {e}")
+                if isinstance(e, AttributeError) and "call_exception_handler" in str(e):
+                    self.connection_lost(e)
 
         elif isinstance(event, StreamReset):
             logger.info(f"Stream {event.stream_id} reset unexpectedly.")

@@ -14,6 +14,33 @@ logger = logging.getLogger("QuicServer")
 # Global list to track active protocol instances
 active_protocols = []
 
+def _udp_frame(payload: bytes) -> bytes:
+    ln = len(payload)
+    if ln > 0xFFFF:
+        raise ValueError(f"UDP payload too large to frame: {ln}")
+    return ln.to_bytes(2, "big") + payload
+
+
+class _UdpReassembler:
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        if not chunk:
+            return []
+        self.buf.extend(chunk)
+        out: list[bytes] = []
+        while True:
+            if len(self.buf) < 2:
+                break
+            ln = int.from_bytes(self.buf[0:2], "big")
+            if len(self.buf) < 2 + ln:
+                break
+            out.append(bytes(self.buf[2 : 2 + ln]))
+            del self.buf[: 2 + ln]
+        return out
+
+
 class TunnelServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -21,6 +48,7 @@ class TunnelServerProtocol(QuicConnectionProtocol):
         self.tcp_connections = {}  # Map TCP connections to QUIC streams
         self.udp_connections = {}  # Map UDP connections to QUIC streams
         self.udp_last_activity = {}  # Track last activity time for UDP connections
+        self.udp_stream_rx = {}  # Per-stream reassembly buffers for UDP frames
         active_protocols.append(self)  # Add this protocol instance to the list
         try:
             asyncio.create_task(self.cleanup_stale_udp_connections())
@@ -49,6 +77,7 @@ class TunnelServerProtocol(QuicConnectionProtocol):
             transport.close()
         self.udp_connections.clear()
         self.udp_last_activity.clear()
+        self.udp_stream_rx.clear()
 
 
     def close_this_stream(self, stream_id):
@@ -69,6 +98,7 @@ class TunnelServerProtocol(QuicConnectionProtocol):
                 transport.close()
                 del self.udp_connections[stream_id]
                 del self.udp_last_activity[stream_id]
+                self.udp_stream_rx.pop(stream_id, None)
         except Exception as e:
             logger.info(f"Error closing socket at server: {e}")
 
@@ -137,7 +167,7 @@ class TunnelServerProtocol(QuicConnectionProtocol):
                 if(data == None):
                     break
                 # logger.info(f"Forwarding data from UDP to QUIC on stream {stream_id}")
-                self._quic.send_stream_data(stream_id, data)
+                self._quic.send_stream_data(stream_id, _udp_frame(data))
                 self.transmit()  # Flush
                 self.udp_last_activity[stream_id] = self.loop.time()
         except Exception as e:
@@ -158,7 +188,7 @@ class TunnelServerProtocol(QuicConnectionProtocol):
                 self.transport = transport
 
             def datagram_received(self, data, addr):
-                logger.info(f"put this to queue data={data} addr={addr}")
+                logger.debug("UDP datagram received from %s (%d bytes)", addr, len(data) if data else 0)
                 self.queue.put_nowait((data, addr))
 
             def error_received(self, exc):
@@ -185,6 +215,7 @@ class TunnelServerProtocol(QuicConnectionProtocol):
             )
             self.udp_connections[stream_id] = (transport, protocol)
             self.udp_last_activity[stream_id] = self.loop.time()  # Track last activity time
+            self.udp_stream_rx[stream_id] = _UdpReassembler()
             logger.info(f"UDP connection established for stream {stream_id} to port {target_port}")
 
             asyncio.create_task(self.forward_udp_to_quic(stream_id, protocol))
@@ -220,7 +251,12 @@ class TunnelServerProtocol(QuicConnectionProtocol):
                 # Forward data to the corresponding UDP connection
                 elif event.stream_id in self.udp_connections:
                     transport, _ = self.udp_connections[event.stream_id]
-                    transport.sendto(event.data)  # Send data over UDP
+                    rx = self.udp_stream_rx.get(event.stream_id)
+                    if rx is None:
+                        rx = _UdpReassembler()
+                        self.udp_stream_rx[event.stream_id] = rx
+                    for datagram in rx.feed(event.data):
+                        transport.sendto(datagram)
                     self.udp_last_activity[event.stream_id] = self.loop.time()  # Update last activity time
 
                 else:
